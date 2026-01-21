@@ -1,4 +1,3 @@
-# database.py
 import sqlite3
 import logging
 from datetime import datetime
@@ -11,9 +10,15 @@ class TaskDatabase:
         self.db_name = db_name
         self.init_database()
     
+    def get_connection(self):
+        """Получение соединения с базой данных"""
+        conn = sqlite3.connect(self.db_name)
+        conn.row_factory = sqlite3.Row  # Для доступа к колонкам по имени
+        return conn
+    
     def init_database(self):
         """Инициализация базы данных и таблиц"""
-        conn = sqlite3.connect(self.db_name)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
         # Таблица для задач
@@ -25,6 +30,7 @@ class TaskDatabase:
                 limit_count INTEGER DEFAULT 300,
                 status TEXT DEFAULT 'pending', -- pending, processing, completed, failed
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP NULL,
                 completed_at TIMESTAMP NULL,
                 result_filename TEXT NULL,
                 users_found INTEGER DEFAULT 0,
@@ -32,19 +38,27 @@ class TaskDatabase:
             )
         ''')
         
+        # Индексы для ускорения запросов
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON parsing_tasks(status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON parsing_tasks(user_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON parsing_tasks(created_at)')
+        
         conn.commit()
         conn.close()
         logger.info(f"База данных {self.db_name} инициализирована")
     
     def create_task(self, user_id, chat_link, limit_count):
         """Создание новой задачи"""
-        conn = sqlite3.connect(self.db_name)
+        conn = self.get_connection()
         cursor = conn.cursor()
+        
+        # Ограничиваем длину ссылки
+        chat_link_short = chat_link[:200]
         
         cursor.execute('''
             INSERT INTO parsing_tasks (user_id, chat_link, limit_count, status)
             VALUES (?, ?, ?, 'pending')
-        ''', (user_id, chat_link, limit_count))
+        ''', (user_id, chat_link_short, limit_count))
         
         task_id = cursor.lastrowid
         conn.commit()
@@ -55,7 +69,7 @@ class TaskDatabase:
     
     def get_pending_task(self):
         """Получение следующей задачи для обработки"""
-        conn = sqlite3.connect(self.db_name)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -66,60 +80,74 @@ class TaskDatabase:
             LIMIT 1
         ''')
         
-        task = cursor.fetchone()
+        row = cursor.fetchone()
         conn.close()
         
-        if task:
-            logger.info(f"Найдена задача #{task[0]} для обработки")
-            return {
-                'id': task[0],
-                'user_id': task[1],
-                'chat_link': task[2],
-                'limit_count': task[3]
-            }
+        if row:
+            task = dict(row)
+            logger.info(f"Найдена задача #{task['id']} для обработки")
+            return task
         return None
     
     def update_task_status(self, task_id, status, result_filename=None, users_found=0, error_message=None):
         """Обновление статуса задачи"""
-        conn = sqlite3.connect(self.db_name)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
-        if status == 'completed':
-            cursor.execute('''
-                UPDATE parsing_tasks 
-                SET status = ?, 
-                    completed_at = CURRENT_TIMESTAMP,
-                    result_filename = ?,
-                    users_found = ?
-                WHERE id = ?
-            ''', (status, result_filename, users_found, task_id))
-        elif status == 'failed':
-            cursor.execute('''
-                UPDATE parsing_tasks 
-                SET status = ?, 
-                    completed_at = CURRENT_TIMESTAMP,
-                    error_message = ?
-                WHERE id = ?
-            ''', (status, error_message, task_id))
-        else:
-            cursor.execute('''
-                UPDATE parsing_tasks 
-                SET status = ?
-                WHERE id = ?
-            ''', (status, task_id))
-        
-        conn.commit()
-        conn.close()
-        logger.info(f"Задача #{task_id} обновлена: статус={status}")
+        try:
+            if status == 'processing':
+                cursor.execute('''
+                    UPDATE parsing_tasks 
+                    SET status = ?, 
+                        started_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (status, task_id))
+            elif status == 'completed':
+                # Ограничиваем длину имени файла
+                filename_short = result_filename[:100] if result_filename else None
+                cursor.execute('''
+                    UPDATE parsing_tasks 
+                    SET status = ?, 
+                        completed_at = CURRENT_TIMESTAMP,
+                        result_filename = ?,
+                        users_found = ?
+                    WHERE id = ?
+                ''', (status, filename_short, users_found, task_id))
+            elif status == 'failed':
+                # Ограничиваем длину сообщения об ошибке
+                error_short = error_message[:200] if error_message else None
+                cursor.execute('''
+                    UPDATE parsing_tasks 
+                    SET status = ?, 
+                        completed_at = CURRENT_TIMESTAMP,
+                        error_message = ?
+                    WHERE id = ?
+                ''', (status, error_short, task_id))
+            else:
+                cursor.execute('''
+                    UPDATE parsing_tasks 
+                    SET status = ?
+                    WHERE id = ?
+                ''', (status, task_id))
+            
+            conn.commit()
+            logger.info(f"Задача #{task_id} обновлена: статус={status}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении задачи #{task_id}: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
     
     def get_user_tasks(self, user_id, limit=5):
         """Получение задач пользователя"""
-        conn = sqlite3.connect(self.db_name)
+        conn = self.get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
             SELECT id, chat_link, limit_count, status, 
-                   created_at, completed_at, users_found, error_message
+                   created_at, started_at, completed_at, 
+                   users_found, error_message
             FROM parsing_tasks 
             WHERE user_id = ? 
             ORDER BY created_at DESC 
@@ -128,19 +156,34 @@ class TaskDatabase:
         
         tasks = []
         for row in cursor.fetchall():
-            tasks.append({
-                'id': row[0],
-                'chat_link': row[1],
-                'limit_count': row[2],
-                'status': row[3],
-                'created_at': row[4],
-                'completed_at': row[5],
-                'users_found': row[6],
-                'error_message': row[7]
-            })
+            task_dict = dict(row)
+            # Преобразуем timestamp в строку
+            for time_field in ['created_at', 'started_at', 'completed_at']:
+                if task_dict.get(time_field):
+                    task_dict[time_field] = str(task_dict[time_field])
+            tasks.append(task_dict)
         
         conn.close()
         return tasks
+    
+    def cleanup_old_tasks(self, days_old=7):
+        """Очистка старых задач"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            DELETE FROM parsing_tasks 
+            WHERE created_at < datetime('now', ?)
+        ''', (f'-{days_old} days',))
+        
+        deleted_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        if deleted_count > 0:
+            logger.info(f"Удалено {deleted_count} старых задач (старше {days_old} дней)")
+        
+        return deleted_count
 
 # Глобальный экземпляр базы данных
 db = TaskDatabase()
