@@ -185,5 +185,37 @@ class TaskDatabase:
         
         return deleted_count
 
+def delete_task(self, task_id, user_id):
+    """Удаляет задачу пользователя"""
+    conn = self.get_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Проверяем, принадлежит ли задача пользователю
+        cursor.execute(
+            "SELECT id FROM parsing_tasks WHERE id = ? AND user_id = ?",
+            (task_id, user_id)
+        )
+        
+        if not cursor.fetchone():
+            conn.close()
+            return False
+        
+        # Удаляем задачу
+        cursor.execute("DELETE FROM parsing_tasks WHERE id = ?", (task_id,))
+        conn.commit()
+        
+        deleted = cursor.rowcount > 0
+        logger.info(f"Задача #{task_id} удалена пользователем {user_id}")
+        
+        return deleted
+        
+    except Exception as e:
+        logger.error(f"Ошибка при удалении задачи #{task_id}: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
 # Глобальный экземпляр базы данных
 db = TaskDatabase()
