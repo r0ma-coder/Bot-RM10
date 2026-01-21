@@ -28,7 +28,7 @@ class TaskDatabase:
                 user_id INTEGER NOT NULL,
                 chat_link TEXT NOT NULL,
                 limit_count INTEGER DEFAULT 300,
-                status TEXT DEFAULT 'pending', -- pending, processing, completed, failed
+                status TEXT DEFAULT 'pending', -- pending, processing, completed, failed, cancelled
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 started_at TIMESTAMP NULL,
                 completed_at TIMESTAMP NULL,
@@ -68,7 +68,7 @@ class TaskDatabase:
         return task_id
     
     def get_pending_task(self):
-        """Получение следующей задачи для обработки"""
+        """Получение следующей задачи для обработки (только pending)"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
@@ -89,6 +89,35 @@ class TaskDatabase:
             return task
         return None
     
+    def get_task_info(self, task_id, user_id=None):
+        """Получение информации о задаче"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        if user_id:
+            cursor.execute('''
+                SELECT id, user_id, chat_link, limit_count, status,
+                       created_at, started_at, completed_at,
+                       users_found, error_message
+                FROM parsing_tasks 
+                WHERE id = ? AND user_id = ?
+            ''', (task_id, user_id))
+        else:
+            cursor.execute('''
+                SELECT id, user_id, chat_link, limit_count, status,
+                       created_at, started_at, completed_at,
+                       users_found, error_message
+                FROM parsing_tasks 
+                WHERE id = ?
+            ''', (task_id,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return dict(row)
+        return None
+    
     def update_task_status(self, task_id, status, result_filename=None, users_found=0, error_message=None):
         """Обновление статуса задачи"""
         conn = self.get_connection()
@@ -100,7 +129,7 @@ class TaskDatabase:
                     UPDATE parsing_tasks 
                     SET status = ?, 
                         started_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
+                    WHERE id = ? AND status != 'cancelled'
                 ''', (status, task_id))
             elif status == 'completed':
                 # Ограничиваем длину имени файла
@@ -111,7 +140,7 @@ class TaskDatabase:
                         completed_at = CURRENT_TIMESTAMP,
                         result_filename = ?,
                         users_found = ?
-                    WHERE id = ?
+                    WHERE id = ? AND status != 'cancelled'
                 ''', (status, filename_short, users_found, task_id))
             elif status == 'failed':
                 # Ограничиваем длину сообщения об ошибке
@@ -121,8 +150,15 @@ class TaskDatabase:
                     SET status = ?, 
                         completed_at = CURRENT_TIMESTAMP,
                         error_message = ?
-                    WHERE id = ?
+                    WHERE id = ? AND status != 'cancelled'
                 ''', (status, error_short, task_id))
+            elif status == 'cancelled':
+                cursor.execute('''
+                    UPDATE parsing_tasks 
+                    SET status = ?,
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (status, task_id))
             else:
                 cursor.execute('''
                     UPDATE parsing_tasks 
@@ -131,15 +167,67 @@ class TaskDatabase:
                 ''', (status, task_id))
             
             conn.commit()
-            logger.info(f"Задача #{task_id} обновлена: статус={status}")
+            updated = cursor.rowcount > 0
+            
+            if updated:
+                logger.info(f"Задача #{task_id} обновлена: статус={status}")
+            else:
+                logger.warning(f"Задача #{task_id} не была обновлена (возможно, отменена)")
+            
+            return updated
             
         except Exception as e:
             logger.error(f"Ошибка при обновлении задачи #{task_id}: {e}")
             conn.rollback()
+            return False
         finally:
             conn.close()
     
-    def get_user_tasks(self, user_id, limit=5):
+    def cancel_task(self, task_id, user_id):
+        """Отмена задачи пользователем"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Проверяем, можно ли отменить задачу (только pending или processing)
+            cursor.execute('''
+                SELECT status FROM parsing_tasks 
+                WHERE id = ? AND user_id = ? AND status IN ('pending', 'processing')
+            ''', (task_id, user_id))
+            
+            task = cursor.fetchone()
+            
+            if not task:
+                conn.close()
+                logger.warning(f"Пользователь {user_id} пытался отменить задачу #{task_id}, но она не найдена или недоступна")
+                return False
+            
+            # Обновляем статус на cancelled
+            cursor.execute('''
+                UPDATE parsing_tasks 
+                SET status = 'cancelled',
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+            ''', (task_id, user_id))
+            
+            conn.commit()
+            cancelled = cursor.rowcount > 0
+            
+            if cancelled:
+                logger.info(f"Задача #{task_id} отменена пользователем {user_id}")
+            else:
+                logger.warning(f"Не удалось отменить задачу #{task_id}")
+            
+            return cancelled
+            
+        except Exception as e:
+            logger.error(f"Ошибка при отмене задачи #{task_id}: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+    
+    def get_user_tasks(self, user_id, limit=10):
         """Получение задач пользователя"""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -184,38 +272,6 @@ class TaskDatabase:
             logger.info(f"Удалено {deleted_count} старых задач (старше {days_old} дней)")
         
         return deleted_count
-
-def delete_task(self, task_id, user_id):
-    """Удаляет задачу пользователя"""
-    conn = self.get_connection()
-    cursor = conn.cursor()
-    
-    try:
-        # Проверяем, принадлежит ли задача пользователю
-        cursor.execute(
-            "SELECT id FROM parsing_tasks WHERE id = ? AND user_id = ?",
-            (task_id, user_id)
-        )
-        
-        if not cursor.fetchone():
-            conn.close()
-            return False
-        
-        # Удаляем задачу
-        cursor.execute("DELETE FROM parsing_tasks WHERE id = ?", (task_id,))
-        conn.commit()
-        
-        deleted = cursor.rowcount > 0
-        logger.info(f"Задача #{task_id} удалена пользователем {user_id}")
-        
-        return deleted
-        
-    except Exception as e:
-        logger.error(f"Ошибка при удалении задачи #{task_id}: {e}")
-        conn.rollback()
-        return False
-    finally:
-        conn.close()
 
 # Глобальный экземпляр базы данных
 db = TaskDatabase()
